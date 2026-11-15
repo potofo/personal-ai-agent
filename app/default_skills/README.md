@@ -7,6 +7,7 @@ user who disables, edits or deletes it keeps that choice.
 | Skill | Source | License |
 | --- | --- | --- |
 | `skill-creator` | [anthropics/skills](https://github.com/anthropics/skills/tree/1780c5e5a552fd4d1c9d6a7b0cab26b0c2bef064/skills/skill-creator) at commit `1780c5e5a552fd4d1c9d6a7b0cab26b0c2bef064`, unmodified | Apache-2.0 (`skill-creator/LICENSE.txt`) |
+| `weekly-weather` | This project (written with the agent, then edited) | Same as this repository |
 
 This environment cannot run the skill's scripts, sub-agents or eval loop. The agent's
 instructions tell it to skip those steps and save skills with the `save_skill` and

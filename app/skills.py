@@ -28,6 +28,8 @@ MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_TOTAL_BYTES = 50 * 1024 * 1024
 MAX_READ_CHARS = 40_000  # what a tool call returns to the model
 MAX_WRITE_BYTES = 200 * 1024  # a file the model writes with write_skill_file
+INLINE_SKILL_CHARS = 8_000  # SKILL.md bodies up to this size are always in the instructions
+INLINE_TOTAL_CHARS = 16_000
 IGNORED_PARTS = {'__MACOSX', '.git', '__pycache__', '.DS_Store'}
 
 SKILL_TEMPLATE = """---
@@ -304,10 +306,26 @@ class SkillStore:
                  'ユーザーへの返答では、ツール名（load_skill など）や内部の手順には触れず、自然な言葉で話してください。']
         skills = self.enabled()
         if skills:
-            lines.append('利用可能なスキルがあります。ユーザーの依頼がスキルの説明に当てはまる場合は、'
-                         '回答の前に load_skill でそのスキルの手順を読み込み、それに従ってください。'
-                         'スキル内の参照ファイルが必要なら read_skill_file で読みます。スクリプトは実行できません。')
-            lines += [f"- {s['name']}: {' '.join(s['description'].split())}" for s in skills]
+            # Small skills are inlined: a light model often skips the load_skill call, so their
+            # instructions are always in context. Large ones stay behind load_skill.
+            inline, lazy, budget = [], [], INLINE_TOTAL_CHARS
+            for sk in skills:
+                body = parse_skill_md(self.read_file(sk['name'], 'SKILL.md'))[1].strip()
+                if len(body) <= INLINE_SKILL_CHARS and len(body) <= budget:
+                    inline.append((sk, body))
+                    budget -= len(body)
+                else:
+                    lazy.append(sk)
+            lines.append('利用可能なスキルがあります。ユーザーの依頼がいずれかのスキルの説明に当てはまる場合は、'
+                         '必ずそのスキルの手順と出力形式に従ってください（Web 検索などのツールは、手順の中で必要なら使います）。')
+            for sk, body in inline:
+                lines.append(f"### スキル「{sk['name']}」（読み込み済み・load_skill は不要）\n"
+                             f"説明: {' '.join(sk['description'].split())}\n{body}")
+            if lazy:
+                lines.append('次のスキルは本文が長いため未読み込みです。依頼が当てはまる場合は、'
+                             '他のツールより先に load_skill で読み込んでから従ってください。'
+                             '参照ファイルは read_skill_file で読みます。スクリプトは実行できません。')
+                lines += [f"- {sk['name']}: {' '.join(sk['description'].split())}" for sk in lazy]
         return '\n'.join(lines)
 
     def tool_defs(self) -> list[dict]:
