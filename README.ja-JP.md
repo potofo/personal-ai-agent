@@ -25,6 +25,13 @@
 
 `WEB_SEARCH_DEPLOYMENT` を設定すると、モデルは最新情報が必要な質問で `web_search` ツールを呼びます。バックエンドが同じ API キーで、Responses API の Web 検索ツールに対応したチャットモデル（例：`gpt-6.1-terra`）に検索させ、要点と出典をモデルに返します。音声チャットでは、ブラウザが受け取ったツール呼び出しを `/api/tools/call` で実行します。
 
+## チャットと表示
+
+- **チャット**：左ペイン（狭い画面では下部）に一覧を表示します。「＋ 新規チャット」で新しいチャットを始め、クリックで過去のチャットを開き、🗑 で削除します。名前は最初のメッセージから自動で付きます。モデルの文脈に入るのは、そのチャットの履歴だけです。音声で話した内容は、通話を始めたチャットに保存されます。定期ジョブの結果は「⏰ 定期ジョブの結果」に入ります。
+- **既存データの移行**：チャット機能より前の履歴は、初回起動時に「これまでの会話」という 1 つのチャットにまとめます。
+- **リッチ表示**：エージェントの返答は Markdown（表、見出し、リンクなど）で表示します（[marked](https://marked.js.org/) と [DOMPurify](https://github.com/cure53/DOMPurify) を cdnjs から読み込み。読み込めない場合はプレーンテキスト）。
+- **インフォグラフィック**：テキストチャットで図解を頼むと、モデルは ```` ```html ```` ブロックで自己完結した HTML／SVG を返し、画面がそれを図として描画します。描画は `sandbox` 付き iframe（スクリプト、フォーム、ポップアップ、遷移は不可）で行い、CSP ですべての外部読み込みを禁止しています。音声では図は出さず、口頭で要点を伝えます。
+
 ## Agent Skills
 
 [Agent Skills](https://agentskills.io) 形式（`SKILL.md` を含むフォルダ）のスキルを、Web UI の「スキル」セクションで管理できます。
@@ -32,6 +39,9 @@
 - **保存先**：`/data/skills/<name>/`（永続ボリューム）。有効/無効の状態は `/data/skills/.state.json` に保存します。
 - **インポート**：スキルフォルダの `.zip` / `.skill`（1 つの zip に複数スキルも可）、または `SKILL.md` 単体。同名のスキルは「同名は上書き」にチェックしたときだけ置き換えます。
 - **エクスポート**：スキルごと、またはすべてを zip（`<name>/SKILL.md ...` の形）でダウンロード。他の Agent Skills 対応ツールでもそのまま使えます。
+- **既定スキル**：Anthropic の [skill-creator](https://github.com/anthropics/skills/tree/main/skills/skill-creator)（Apache-2.0、改変なし）を同梱し、初回起動時に `/data/skills` へ配置します。一度配置したら、無効化・編集・削除しても再配置しません。スクリプトやサブエージェント、評価ループはこの環境では実行できないため、エージェントはそれらの手順を省き、保存ツールで保存します。取得元のコミットは [app/default_skills/README.md](app/default_skills/README.md) に記録しています。
+- **再読み込み**：「⟳ 再読み込み」ボタンで、保存先の最新状態を一覧に反映します（ターミナルでの直接編集や、別タブ・音声での保存を反映したいとき）。
+- **チャットでの作成・修正**：「〇〇のスキルを作って」と頼むと、エージェントが SKILL.md を組み立てて `save_skill` で保存します。参照資料は `write_skill_file` で `references/` などに書き込みます。既存スキルを直すときは `load_skill` で読んでから更新します。エージェントはスキルを削除できません（削除は画面から行います）。
 - **エージェントでの利用**：有効なスキルの `name` と `description` だけを指示文に入れます。依頼が説明に当てはまると、モデルが `load_skill`（SKILL.md と同梱ファイル一覧）と `read_skill_file`（参照ファイル）を呼びます。テキスト・音声・定期ジョブのどれでも使えます。
 - **制限**：スキル内のスクリプトは**実行しません**（読み取りのみ）。インポート時は、上位フォルダへのパス、絶対パス、シンボリックリンク、大きすぎる zip（20MB 超、展開後 50MB 超、300 ファイル超、1 ファイル 5MB 超）を拒否します。`name` は英小文字・数字・ハイフン（64 文字以内）、`description` は必須（1024 文字以内）です。
 
@@ -61,8 +71,9 @@
 ```
 .
 ├── app/main.py           # FastAPI：API、Realtime 接続（WebSocket / WebRTC 中継）、ツール、スケジューラー、SQLite
-├── app/skills.py         # Agent Skills の保存、インポート／エクスポート、検証、モデル用ツール
-├── app/static/index.html # Web UI（チャット、音声、定期ジョブ）
+├── app/skills.py         # Agent Skills の保存、インポート／エクスポート、検証、既定スキルの配置、モデル用ツール
+├── app/default_skills/   # 既定スキル（Anthropic の skill-creator、Apache-2.0）
+├── app/static/index.html # Web UI（チャット、音声、スキル、定期ジョブ。広い画面では左ペインにスキルと定期ジョブ）
 ├── entrypoint.sh         # Coder エージェント（任意）をバックグラウンドで起動し、uvicorn を前面で実行
 ├── Dockerfile            # python:3.12-slim + tini + curl、非 root（UID 10001）、HEALTHCHECK
 ├── requirements.txt      # fastapi, uvicorn, httpx, websockets, apscheduler, pydantic, PyYAML
@@ -76,10 +87,12 @@
 | `GET` | `/` | Web UI |
 | `GET` | `/health` | ヘルスチェック（`{"ok": true}`） |
 | `GET` | `/api/status` | 設定状態（キーの有無、デプロイ名、エンドポイントのホスト名。キーそのものは返しません） |
-| `POST` | `/api/chat` | `{"message": "..."}` を送ると `{"answer": "..."}` が返る |
-| `POST` | `/api/realtime/sdp` | 本文に SDP offer（`application/sdp`）を送ると SDP answer が返る |
+| `POST` | `/api/chat` | `{"message": "...", "conversation_id": "..."}` を送ると `{"answer": "...", "conversation_id": "..."}` が返る（`conversation_id` を省くと新しいチャットを作成） |
+| `GET` / `POST` | `/api/conversations` | チャット一覧（更新順） / 新規作成 |
+| `PATCH` / `DELETE` | `/api/conversations/{id}` | `{"title": "..."}` で名前を変更 / チャットとそのメッセージを削除 |
+| `POST` | `/api/realtime/sdp?conversation_id=...` | 本文に SDP offer（`application/sdp`）を送ると SDP answer が返る |
 | `POST` | `/api/tools/call` | 音声セッションのツール呼び出しを実行：`{"name": "web_search", "arguments": "{\"query\": \"...\"}"}` |
-| `POST` | `/api/transcripts` | 音声の書き起こしを保存：`{"role": "user"\|"assistant", "content": "..."}` |
+| `POST` | `/api/transcripts` | 音声の書き起こしを保存：`{"role": "user"\|"assistant", "content": "...", "conversation_id": "..."}` |
 | `GET` | `/api/skills` | スキル一覧（名前、説明、有効/無効、ファイル数、エラー） |
 | `POST` | `/api/skills` | `{"content": "<SKILL.md>"}` で新規作成 |
 | `POST` | `/api/skills/import?filename=x.zip&overwrite=false` | 本文にファイル（.zip / .skill / SKILL.md）を送ってインポート |
@@ -88,7 +101,7 @@
 | `GET` | `/api/skills/{name}/export` | スキルを zip でダウンロード |
 | `GET` | `/api/skills/{name}/files/{path}` | 同梱ファイルの内容 |
 | `GET` | `/api/skills/template?name=...` | 新規作成用の SKILL.md ひな形 |
-| `GET` | `/api/history` | 直近 100 件のメッセージ（`channel` は `text` / `voice` / `job`） |
+| `GET` | `/api/history?conversation_id=...` | そのチャットの直近 200 件のメッセージ（`channel` は `text` / `voice` / `job`） |
 | `POST` | `/api/jobs` | 毎日のジョブを登録：`{"hour": 7, "minute": 0, "prompt": "..."}` |
 | `GET` | `/api/jobs` | 登録済みジョブの一覧 |
 | `DELETE` | `/api/jobs/{id}` | ジョブを削除 |

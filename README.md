@@ -25,6 +25,13 @@ A proof of concept of an **always-on personal AI agent that runs in a dedicated 
 
 With `WEB_SEARCH_DEPLOYMENT` set, the model calls a `web_search` tool for questions that need current information. The backend uses the same API key to have a chat deployment that supports the Responses API web search tool (e.g. `gpt-6.1-terra`) search the web, and returns a summary with sources to the model. In voice chat, the browser runs the tool calls it receives through `/api/tools/call`.
 
+## Chats and rendering
+
+- **Chats:** listed in the left pane (at the bottom on narrow screens). "+ New chat" starts one, clicking opens a past chat, 🗑 deletes it. Titles come from the first message. Only that chat's history goes into the model's context. Voice transcripts are saved to the chat where the call started. Scheduled job results go to "⏰ 定期ジョブの結果".
+- **Migration:** history from before chats existed becomes one chat named "これまでの会話" on first start.
+- **Rich rendering:** agent replies render as Markdown (tables, headings, links) using [marked](https://marked.js.org/) and [DOMPurify](https://github.com/cure53/DOMPurify) from cdnjs, falling back to plain text if they cannot load.
+- **Infographics:** ask for a visual in text chat and the model returns a self-contained HTML/SVG ```` ```html ```` block, which the page draws. It is rendered in a sandboxed iframe (no scripts, forms, popups or navigation) with a CSP that blocks every external load. Voice replies describe the content instead.
+
 ## Agent Skills
 
 Skills in the [Agent Skills](https://agentskills.io) format (a folder containing `SKILL.md`) are managed in the "Skills" section of the web UI.
@@ -32,6 +39,9 @@ Skills in the [Agent Skills](https://agentskills.io) format (a folder containing
 - **Storage:** `/data/skills/<name>/` (persistent volume). Enabled/disabled state is in `/data/skills/.state.json`.
 - **Import:** a skill folder as `.zip` / `.skill` (several skills per zip are fine), or a bare `SKILL.md`. A skill with the same name is replaced only when "overwrite" is checked.
 - **Export:** one skill or all skills as a zip (`<name>/SKILL.md ...`), usable as-is by other Agent Skills tools.
+- **Default skill:** Anthropic's [skill-creator](https://github.com/anthropics/skills/tree/main/skills/skill-creator) (Apache-2.0, unmodified) is bundled and copied into `/data/skills` on first start. Once seeded it is never re-added, even if the user disables, edits or deletes it. This environment cannot run its scripts, sub-agents or eval loop, so the agent skips those steps and saves with the save tools. The upstream commit is recorded in [app/default_skills/README.md](app/default_skills/README.md).
+- **Reload:** the "⟳ Reload" button refreshes the list from storage (for edits made in a terminal, another tab or a voice session).
+- **Create and edit from chat:** ask "make a skill for ..." and the agent writes SKILL.md and saves it with `save_skill`; bundled references are written with `write_skill_file`. To change an existing skill it reads it with `load_skill` first. The agent cannot delete skills (delete them in the UI).
 - **Use by the agent:** only `name` and `description` of enabled skills go into the instructions. When a request matches, the model calls `load_skill` (SKILL.md plus the file list) and `read_skill_file` (bundled files). Works in text, voice and scheduled jobs.
 - **Limits:** scripts inside skills are **never executed** (read-only). Import rejects parent-directory or absolute paths, symlinks and oversized archives (over 20MB, over 50MB extracted, over 300 files, or any file over 5MB). `name` must be lowercase letters, digits and hyphens (up to 64 characters); `description` is required (up to 1024 characters).
 
@@ -61,8 +71,9 @@ Browser ──HTTPS──► Coder (Entra ID auth, app proxy, share=owner)
 ```
 .
 ├── app/main.py           # FastAPI: API, Realtime (WebSocket / WebRTC relay), tools, scheduler, SQLite
-├── app/skills.py         # Agent Skills storage, import/export, validation, model tools
-├── app/static/index.html # Web UI (chat, voice, scheduled jobs)
+├── app/skills.py         # Agent Skills storage, import/export, validation, default-skill seeding, model tools
+├── app/default_skills/   # Default skills (Anthropic skill-creator, Apache-2.0)
+├── app/static/index.html # Web UI (chat, voice, skills, scheduled jobs; skills and jobs in a left pane on wide screens)
 ├── entrypoint.sh         # Starts the Coder agent (optional) in the background, runs uvicorn in the foreground
 ├── Dockerfile            # python:3.12-slim + tini + curl, non-root (UID 10001), HEALTHCHECK
 ├── requirements.txt      # fastapi, uvicorn, httpx, websockets, apscheduler, pydantic, PyYAML
@@ -76,10 +87,12 @@ Browser ──HTTPS──► Coder (Entra ID auth, app proxy, share=owner)
 | `GET` | `/` | Web UI |
 | `GET` | `/health` | Health check (`{"ok": true}`) |
 | `GET` | `/api/status` | Configuration state (whether a key is set, deployment, endpoint host; never the key) |
-| `POST` | `/api/chat` | Send `{"message": "..."}`, get `{"answer": "..."}` |
-| `POST` | `/api/realtime/sdp` | Send an SDP offer (`application/sdp`), get the SDP answer |
+| `POST` | `/api/chat` | Send `{"message": "...", "conversation_id": "..."}`, get `{"answer": "...", "conversation_id": "..."}` (omit `conversation_id` to start a new chat) |
+| `GET` / `POST` | `/api/conversations` | List chats (most recent first) / create one |
+| `PATCH` / `DELETE` | `/api/conversations/{id}` | Rename with `{"title": "..."}` / delete the chat and its messages |
+| `POST` | `/api/realtime/sdp?conversation_id=...` | Send an SDP offer (`application/sdp`), get the SDP answer |
 | `POST` | `/api/tools/call` | Run a tool call from the voice session: `{"name": "web_search", "arguments": "{\"query\": \"...\"}"}` |
-| `POST` | `/api/transcripts` | Save a voice transcript: `{"role": "user"\|"assistant", "content": "..."}` |
+| `POST` | `/api/transcripts` | Save a voice transcript: `{"role": "user"\|"assistant", "content": "...", "conversation_id": "..."}` |
 | `GET` | `/api/skills` | List skills (name, description, enabled, file count, errors) |
 | `POST` | `/api/skills` | Create from `{"content": "<SKILL.md>"}` |
 | `POST` | `/api/skills/import?filename=x.zip&overwrite=false` | Import the file in the body (.zip / .skill / SKILL.md) |
@@ -88,7 +101,7 @@ Browser ──HTTPS──► Coder (Entra ID auth, app proxy, share=owner)
 | `GET` | `/api/skills/{name}/export` | Download one skill as a zip |
 | `GET` | `/api/skills/{name}/files/{path}` | Content of a bundled file |
 | `GET` | `/api/skills/template?name=...` | SKILL.md template for a new skill |
-| `GET` | `/api/history` | Last 100 messages (`channel` is `text` / `voice` / `job`) |
+| `GET` | `/api/history?conversation_id=...` | Last 200 messages of that chat (`channel` is `text` / `voice` / `job`) |
 | `POST` | `/api/jobs` | Register a daily job: `{"hour": 7, "minute": 0, "prompt": "..."}` |
 | `GET` | `/api/jobs` | List jobs |
 | `DELETE` | `/api/jobs/{id}` | Delete a job |

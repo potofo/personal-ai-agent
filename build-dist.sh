@@ -13,6 +13,8 @@ cp terraform/main.tf terraform/README.md "$OUT"/
 cp Dockerfile entrypoint.sh requirements.txt "$OUT/build/"
 cp app/*.py "$OUT/build/app/"
 cp app/static/index.html "$OUT/build/app/static/"
+cp -r app/default_skills "$OUT/build/app/"
+find "$OUT/build" -name __pycache__ -prune -exec rm -rf {} +
 printf '__pycache__\n*.pyc\n' > "$OUT/build/.dockerignore"
 cat > dist/variables.example.yaml <<'YAML'
 # coder templates push personal-agent -d dist/personal-agent-template --variables-file dist/variables.example.yaml

@@ -4,18 +4,36 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Personal AI Agent</title>
+<!-- Markdown rendering + sanitizing. If they fail to load, messages fall back to plain text. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js" defer></script>
 <style>
   :root { --bg:#f6f7f9; --card:#fff; --fg:#1d2329; --muted:#6b7480; --line:#dde1e6; --accent:#2563eb; --user:#e8f0fe; --job:#fff7e0; --danger:#dc2626; }
   @media (prefers-color-scheme: dark) { :root { --bg:#14171a; --card:#1d2125; --fg:#e6e8ea; --muted:#99a1ab; --line:#30363d; --accent:#60a5fa; --user:#1e2a3d; --job:#3a3220; --danger:#f87171; } }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.6 system-ui, "Hiragino Sans", "Meiryo", sans-serif; }
-  main { max-width:820px; margin:0 auto; padding:16px; display:flex; flex-direction:column; gap:12px; min-height:100vh; }
-  header { display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+
+  /* Layout: one column on narrow screens (chat first, then skills/jobs);
+     two columns on wide screens (skills/jobs pane on the left, chat on the right). */
+  .app { max-width:820px; margin:0 auto; padding:16px; display:grid; gap:12px;
+         grid-template-columns:minmax(0, 1fr); grid-template-areas:"top" "chat" "side"; }
+  .top { grid-area:top; display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+  .chat { grid-area:chat; display:flex; flex-direction:column; gap:12px; min-width:0; }
+  .side { grid-area:side; display:flex; flex-direction:column; gap:12px; min-width:0; }
+  #log { overflow-y:auto; min-height:300px; max-height:60vh; display:flex; flex-direction:column; gap:8px; }
+  @media (min-width: 900px) {
+    .app { max-width:1440px; height:100vh; height:100dvh;
+           grid-template-columns:minmax(300px, 380px) minmax(0, 1fr); grid-template-rows:auto minmax(0, 1fr);
+           grid-template-areas:"top top" "side chat"; }
+    .side { overflow-y:auto; min-height:0; padding-right:4px; }
+    .chat { min-height:0; }
+    #log { flex:1; min-height:0; max-height:none; }
+  }
+
   h1 { font-size:18px; margin:0; }
   .status { font-size:12px; color:var(--muted); }
   .status.bad { color:var(--danger); }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; }
-  #log { flex:1; overflow-y:auto; min-height:300px; max-height:60vh; display:flex; flex-direction:column; gap:8px; }
   .msg { padding:8px 10px; border-radius:8px; white-space:pre-wrap; word-break:break-word; max-width:90%; }
   .msg.user { background:var(--user); align-self:flex-end; }
   .msg.assistant { border:1px solid var(--line); align-self:flex-start; }
@@ -30,83 +48,151 @@
   button { padding:8px 14px; border-radius:8px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; }
   button.secondary { background:transparent; color:var(--accent); }
   button.danger { border-color:var(--danger); background:var(--danger); }
+  button.small { padding:4px 10px; font-size:13px; }
   button:disabled { opacity:.5; cursor:default; }
   #voiceState { font-size:13px; color:var(--muted); }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--muted); margin-right:4px; }
   .dot.on { background:#16a34a; animation:pulse 1.2s infinite; }
   @keyframes pulse { 50% { opacity:.3; } }
   details summary { cursor:pointer; font-weight:600; }
-  ul#jobs { list-style:none; padding:0; margin:8px 0 0; display:flex; flex-direction:column; gap:6px; }
-  ul#jobs li { display:flex; gap:8px; align-items:center; justify-content:space-between; border-top:1px solid var(--line); padding-top:6px; }
-  ul#jobs button { padding:2px 10px; font-size:12px; }
   .hint { font-size:12px; color:var(--muted); margin:6px 0; }
+
+  #job #prompt { flex:1 1 100%; }
+  ul#jobs { list-style:none; padding:0; margin:8px 0 0; display:flex; flex-direction:column; gap:6px; }
+  ul#jobs li { display:flex; gap:8px; align-items:center; justify-content:space-between; border-top:1px solid var(--line); padding-top:6px; word-break:break-word; }
+  ul#jobs button { padding:2px 10px; font-size:12px; flex:none; }
+
   ul#skills { list-style:none; padding:0; margin:8px 0 0; display:flex; flex-direction:column; }
-  ul#skills li { display:flex; gap:10px; align-items:flex-start; border-top:1px solid var(--line); padding:8px 0; }
-  ul#skills li .info { flex:1; min-width:0; }
+  ul#skills li { display:grid; grid-template-columns:auto minmax(0, 1fr); column-gap:10px; row-gap:4px; align-items:start; border-top:1px solid var(--line); padding:8px 0; }
+  ul#skills li input { margin-top:5px; }
   ul#skills li .desc { font-size:13px; color:var(--muted); word-break:break-word; }
   ul#skills li .err { font-size:12px; color:var(--danger); }
-  ul#skills li .actions { display:flex; gap:4px; flex-wrap:wrap; }
+  ul#skills li .actions { grid-column:2; display:flex; gap:4px; flex-wrap:wrap; }
   ul#skills li .actions button { padding:2px 8px; font-size:12px; }
   ul#skills li.off .info { opacity:.55; }
-  .editor { margin-top:8px; display:flex; flex-direction:column; gap:8px; }
-  .editor textarea { min-height:320px; max-height:none; font:13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+  dialog { width:min(920px, 95vw); max-height:90vh; border:1px solid var(--line); border-radius:12px; background:var(--card); color:var(--fg); padding:16px; }
+  dialog::backdrop { background:rgba(0, 0, 0, .45); }
+  .editor { display:flex; flex-direction:column; gap:8px; }
+  .editor textarea { min-height:55vh; max-height:none; font:13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+  /* chats */
+  .top .right { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; min-width:0; }
+  ul#convs { list-style:none; padding:0; margin:8px 0 0; display:flex; flex-direction:column; gap:2px; max-height:40vh; overflow-y:auto; }
+  ul#convs li { display:flex; align-items:center; gap:6px; padding:6px 8px; border-radius:8px; cursor:pointer; }
+  ul#convs li:hover { background:var(--bg); }
+  ul#convs li.active { background:var(--user); }
+  ul#convs li .ctext { flex:1; min-width:0; }
+  ul#convs li .ctitle { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:14px; }
+  ul#convs li .cmeta { font-size:11px; color:var(--muted); }
+  ul#convs li button { padding:0 8px; font-size:12px; flex:none; border-color:transparent; background:transparent; color:var(--muted); }
+  ul#convs li button:hover { color:var(--danger); }
+  .chat-title { font-weight:600; font-size:14px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+  /* rich messages */
+  .msg .md { white-space:normal; }
+  .msg .md > :first-child { margin-top:0; } .msg .md > :last-child { margin-bottom:0; }
+  .msg .md p, .msg .md ul, .msg .md ol { margin:.4em 0; }
+  .msg .md h1, .msg .md h2, .msg .md h3 { font-size:1.05em; margin:.8em 0 .3em; }
+  .msg .md table { border-collapse:collapse; margin:.5em 0; display:block; overflow-x:auto; max-width:100%; }
+  .msg .md th, .msg .md td { border:1px solid var(--line); padding:4px 8px; text-align:left; vertical-align:top; }
+  .msg .md th { background:var(--bg); }
+  .msg .md code { background:var(--bg); padding:0 4px; border-radius:4px; font-size:.92em; }
+  .msg .md pre { background:var(--bg); padding:8px; border-radius:6px; overflow-x:auto; }
+  .msg .md pre code { padding:0; }
+  .msg .md a { color:var(--accent); word-break:break-all; }
+  .msg.has-viz { max-width:100%; width:100%; }
+  .viz { margin:.6em 0; }
+  .viz iframe { width:100%; border:1px solid var(--line); border-radius:8px; background:#fff; display:block; height:200px; }
+  .viz .vbar { display:flex; justify-content:flex-end; margin-top:4px; }
+  .viz .vbar button { padding:2px 8px; font-size:12px; }
+
+  /* collapsible skill descriptions */
+  ul#skills li .desc.clamp { display:-webkit-box; -webkit-line-clamp:1; -webkit-box-orient:vertical; overflow:hidden; cursor:pointer; }
+  ul#skills li .desc.clamp.open { display:block; }
+  ul#skills li .desc.clamp::before { content:'▸ '; color:var(--muted); }
+  ul#skills li .desc.clamp.open::before { content:'▾ '; }
+  details.help { margin:6px 0; }
+  details.help summary { font-weight:normal; font-size:12px; color:var(--muted); }
 </style>
 </head>
 <body>
-<main>
-  <header>
+<div class="app">
+  <header class="top">
     <h1>Personal AI Agent</h1>
-    <span id="status" class="status">接続確認中…</span>
+    <div class="right">
+      <span id="status" class="status">接続確認中…</span>
+      <button type="button" class="small secondary" id="newChatTopBtn">＋ 新規チャット</button>
+    </div>
   </header>
 
-  <section id="log" class="card" aria-live="polite"></section>
-
-  <form id="chat" class="row">
-    <textarea id="msg" rows="1" placeholder="メッセージ（Enter で送信、Shift+Enter で改行）" required></textarea>
-    <button id="send">送信</button>
-  </form>
-
-  <div class="card row">
-    <button id="voiceBtn" type="button">🎤 音声チャット開始</button>
-    <span id="voiceState"><span class="dot"></span>待機中</span>
-    <audio id="remote" autoplay></audio>
-  </div>
-
-  <details class="card" id="skillsCard">
-    <summary>スキル（Agent Skills）</summary>
-    <div class="row" style="margin-top:8px">
-      <button type="button" id="skillImportBtn">⬆ インポート</button>
-      <input type="file" id="skillFile" accept=".zip,.skill,.md" multiple hidden>
-      <label style="font-size:13px"><input type="checkbox" id="skillOverwrite"> 同名は上書き</label>
-      <button type="button" class="secondary" id="skillNewBtn">＋ 新規作成</button>
-      <button type="button" class="secondary" id="skillExportAllBtn">⬇ すべてエクスポート</button>
-    </div>
-    <p class="hint">スキルフォルダ（SKILL.md を含む）の .zip / .skill、または SKILL.md を取り込めます。有効なスキルは、依頼が説明に当てはまるとエージェントが自動で読み込みます（スクリプトは実行しません）。</p>
-    <ul id="skills"></ul>
-    <div id="skillEditor" class="editor" hidden>
-      <div class="row" style="justify-content:space-between">
-        <strong id="skillEditorTitle"></strong>
-        <span id="skillEditorFiles" class="hint"></span>
+  <aside class="side" aria-label="チャット一覧、スキル、定期ジョブ">
+    <details class="card pane" id="chatsCard">
+      <summary>チャット</summary>
+      <div class="row" style="margin-top:8px">
+        <button type="button" class="small" id="newChatBtn">＋ 新規チャット</button>
       </div>
-      <textarea id="skillContent" spellcheck="false"></textarea>
-      <div class="row">
-        <button type="button" id="skillSaveBtn">保存</button>
-        <button type="button" class="secondary" id="skillCancelBtn">閉じる</button>
-      </div>
-    </div>
-  </details>
+      <ul id="convs"></ul>
+    </details>
 
-  <details class="card">
-    <summary>定期ジョブ</summary>
-    <form id="job" class="row" style="margin-top:8px">
-      毎日 <input id="hour" type="number" min="0" max="23" value="7">時
-      <input id="minute" type="number" min="0" max="59" value="0">分
-      <input id="prompt" type="text" required placeholder="実行する指示（例：今日の予定の立て方を3行で提案して）">
-      <button>登録</button>
+    <details class="card pane" id="skillsCard">
+      <summary>スキル（Agent Skills）</summary>
+      <div class="row" style="margin-top:8px">
+        <button type="button" class="small" id="skillImportBtn">⬆ インポート</button>
+        <input type="file" id="skillFile" accept=".zip,.skill,.md" multiple hidden>
+        <button type="button" class="small secondary" id="skillNewBtn">＋ 新規作成</button>
+        <button type="button" class="small secondary" id="skillExportAllBtn">⬇ すべてエクスポート</button>
+        <button type="button" class="small secondary" id="skillReloadBtn" title="保存先の最新状態を読み込み直します">⟳ 再読み込み</button>
+        <label style="font-size:13px"><input type="checkbox" id="skillOverwrite"> 同名は上書き</label>
+      </div>
+      <details class="help"><summary>ℹ スキルの使い方</summary>
+        <p class="hint">SKILL.md を含むフォルダの .zip / .skill、または SKILL.md を取り込めます。チャットで「〇〇のスキルを作って」と頼むこともできます。有効なスキルは、依頼が説明に当てはまるとエージェントが自動で使います（スクリプトは実行しません）。説明文はクリックで全文を表示します。</p>
+      </details>
+      <ul id="skills"></ul>
+    </details>
+
+    <details class="card pane" id="jobsCard">
+      <summary>定期ジョブ</summary>
+      <form id="job" class="row" style="margin-top:8px">
+        毎日 <input id="hour" type="number" min="0" max="23" value="7">時
+        <input id="minute" type="number" min="0" max="59" value="0">分
+        <input id="prompt" type="text" required placeholder="実行する指示（例：今日の予定の立て方を3行で提案して）">
+        <button class="small">登録</button>
+      </form>
+      <ul id="jobs"></ul>
+    </details>
+  </aside>
+
+  <main class="chat">
+    <div id="chatTitle" class="chat-title">新しいチャット</div>
+    <section id="log" class="card" aria-live="polite"></section>
+
+    <form id="chat" class="row">
+      <textarea id="msg" rows="1" placeholder="メッセージ（Enter で送信、Shift+Enter で改行）" required></textarea>
+      <button id="send">送信</button>
     </form>
-    <ul id="jobs"></ul>
-  </details>
-</main>
+
+    <div class="card row">
+      <button id="voiceBtn" type="button">🎤 音声チャット開始</button>
+      <span id="voiceState"><span class="dot"></span>待機中</span>
+      <audio id="remote" autoplay></audio>
+    </div>
+  </main>
+</div>
+
+<dialog id="skillDialog">
+  <div class="editor">
+    <div class="row" style="justify-content:space-between">
+      <strong id="skillEditorTitle"></strong>
+      <span id="skillEditorFiles" class="hint"></span>
+    </div>
+    <textarea id="skillContent" spellcheck="false"></textarea>
+    <div class="row">
+      <button type="button" id="skillSaveBtn">保存</button>
+      <button type="button" class="secondary" id="skillCancelBtn">閉じる</button>
+    </div>
+  </div>
+</dialog>
 <script>
 // All URLs are relative so the page also works behind Coder's path-based app proxy.
 const $ = s => document.querySelector(s);
@@ -125,21 +211,110 @@ async function api(path, opts = {}) {
   return r.headers.get('content-type')?.includes('json') ? r.json() : r.text();
 }
 
-function bubble(role, content, meta, extraClass = '') {
+function bubble(role, content, meta, extraClass = '', rich = false) {
   const div = document.createElement('div');
   div.className = `msg ${role} ${extraClass}`;
   const m = document.createElement('div');
   m.className = 'meta'; m.textContent = meta;
   const t = document.createElement('div');
-  t.textContent = content;
+  if (rich) renderRich(t, content); else t.textContent = content;
+  if (t.querySelector('.viz')) div.classList.add('has-viz');
   div.append(m, t);
   return div;
 }
 
+// Assistant messages: Markdown (sanitized) plus ```html blocks drawn as infographics.
+const VIZ_RE = /```(?:html|svg|infographic)[^\n]*\n([\s\S]*?)(?:```|$)/gi;
+function renderRich(el, text) {
+  const vizzes = [];
+  const src = text.replace(VIZ_RE, (_, code) => { vizzes.push(code); return `\n\n<div data-viz="${vizzes.length - 1}"></div>\n\n`; });
+  if (window.marked && window.DOMPurify) {
+    el.innerHTML = DOMPurify.sanitize(marked.parse(src, { gfm:true, breaks:true }));
+    el.className = 'md';
+    el.querySelectorAll('[data-viz]').forEach(ph => ph.replaceWith(vizFrame(vizzes[+ph.dataset.viz] || '')));
+    el.querySelectorAll('a').forEach(a => { a.target = '_blank'; a.rel = 'noopener noreferrer'; });
+  } else { // libraries unavailable: plain text, but still draw the infographics
+    el.style.whiteSpace = 'pre-wrap';
+    src.split(/<div data-viz="(\d+)"><\/div>/).forEach((part, i) =>
+      el.append(i % 2 ? vizFrame(vizzes[+part] || '') : document.createTextNode(part)));
+  }
+}
+
+// The HTML is shown in a sandboxed iframe: no scripts, forms, popups or navigation, and a CSP that
+// blocks every network load. allow-same-origin (without allow-scripts) only lets this page measure its height.
+function vizFrame(code) {
+  const wrap = document.createElement('div'); wrap.className = 'viz';
+  const f = document.createElement('iframe');
+  f.setAttribute('sandbox', 'allow-same-origin');
+  f.setAttribute('referrerpolicy', 'no-referrer');
+  f.title = 'インフォグラフィック';
+  const csp = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:";
+  f.srcdoc = `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}">`
+    + '<meta name="viewport" content="width=device-width, initial-scale=1"><style>html,body{margin:0}body{padding:10px;'
+    + 'font-family:system-ui,"Hiragino Sans","Meiryo",sans-serif;color:#1d2329;background:#fff}svg,img{max-width:100%;height:auto}</style>'
+    + `</head><body>${code}</body></html>`;
+  const fit = () => { try { const d = f.contentDocument; if (d && d.body) f.style.height = Math.min(Math.max(d.documentElement.scrollHeight, 60), 5000) + 'px'; } catch {} };
+  f.addEventListener('load', () => { fit(); setTimeout(fit, 400); try { new ResizeObserver(fit).observe(f.contentDocument.body); } catch {} });
+  const bar = document.createElement('div'); bar.className = 'vbar';
+  const copy = document.createElement('button'); copy.type = 'button'; copy.className = 'secondary'; copy.textContent = 'HTML をコピー';
+  copy.onclick = async () => { try { await navigator.clipboard.writeText(code); copy.textContent = 'コピーしました'; } catch { copy.textContent = 'コピーできませんでした'; } setTimeout(() => { copy.textContent = 'HTML をコピー'; }, 2000); };
+  bar.append(copy); wrap.append(f, bar);
+  return wrap;
+}
+
 function scrollDown() { logEl.scrollTop = logEl.scrollHeight; }
 
+// ---- conversations
+let convId = null, convs = [];
+try { convId = localStorage.getItem('convId'); } catch {}
+function saveConvId() { try { convId ? localStorage.setItem('convId', convId) : localStorage.removeItem('convId'); } catch {} }
+const fmtTime = iso => { const d = new Date(iso); return isNaN(d) ? '' : d.toLocaleString('ja-JP', { month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit' }); };
+
+async function refreshConversations() {
+  convs = await api('api/conversations');
+  if (convId && !convs.some(c => c.id === convId)) { convId = null; saveConvId(); refreshHistory(true); }
+  renderConversations();
+}
+function renderConversations() {
+  const ul = $('#convs'); ul.replaceChildren();
+  if (!convs.length) { const li = document.createElement('li'); li.className = 'hint'; li.style.cursor = 'default'; li.textContent = 'まだチャットはありません。'; ul.append(li); }
+  for (const c of convs) {
+    const li = document.createElement('li'); if (c.id === convId) li.className = 'active';
+    li.title = c.title;
+    const text = document.createElement('div'); text.className = 'ctext';
+    const t = document.createElement('div'); t.className = 'ctitle'; t.textContent = c.title;
+    const m = document.createElement('div'); m.className = 'cmeta'; m.textContent = `${fmtTime(c.updated)} · ${c.message_count} 件`;
+    text.append(t, m);
+    const del = document.createElement('button'); del.type = 'button'; del.textContent = '🗑'; del.title = 'このチャットを削除';
+    del.onclick = async e => {
+      e.stopPropagation();
+      if (!confirm(`チャット「${c.title}」を削除しますか？（元に戻せません）`)) return;
+      try { await api(`api/conversations/${encodeURIComponent(c.id)}`, { method:'DELETE' }); } catch (err) { alert(err.message); }
+      if (c.id === convId) openConversation(null);
+      refreshConversations();
+    };
+    li.onclick = () => openConversation(c.id);
+    li.append(text, del); ul.append(li);
+  }
+  const cur = convs.find(c => c.id === convId);
+  $('#chatTitle').textContent = cur ? cur.title : '新しいチャット';
+}
+function openConversation(id) {
+  if (pc && id !== convId) stopVoice('チャットを切り替えたため終了しました');
+  convId = id; saveConvId(); lastHistory = '';
+  renderConversations(); refreshHistory(true).catch(() => {});
+  if (!matchMedia('(min-width: 900px)').matches) $('#chatTitle').scrollIntoView({ behavior:'smooth' });
+}
+const newChat = () => { openConversation(null); $('#msg').focus(); };
+$('#newChatBtn').onclick = newChat;
+$('#newChatTopBtn').onclick = newChat;
+
 async function refreshHistory(force = false) {
-  const h = await api('api/history');
+  let h = [];
+  if (convId) {
+    try { h = await api(`api/history?conversation_id=${encodeURIComponent(convId)}`); }
+    catch (e) { convId = null; saveConvId(); renderConversations(); }
+  }
   const key = JSON.stringify(h);
   if (!force && key === lastHistory) return;
   lastHistory = key;
@@ -148,9 +323,9 @@ async function refreshHistory(force = false) {
   const live = logEl.querySelector('.live');
   for (const x of h) {
     const meta = `${channelIcon[x.channel] || ''} ${roleName[x.role] || x.role} · ${x.created.replace('T', ' ').slice(0, 16)}`;
-    logEl.insertBefore(bubble(x.role, x.content, meta), live);
+    logEl.insertBefore(bubble(x.role, x.content, meta, '', x.role !== 'user'), live);
   }
-  if (!h.length) logEl.insertBefore(bubble('assistant', 'こんにちは。テキストでも音声でも話しかけてください。', 'エージェント'), live);
+  if (!h.length) logEl.insertBefore(bubble('assistant', convId ? 'このチャットにはまだメッセージがありません。' : '新しいチャットです。テキストでも音声でも話しかけてください。', 'エージェント'), live);
   if (atBottom || force) scrollDown();
 }
 
@@ -191,13 +366,16 @@ $('#chat').onsubmit = async e => {
   const pending = bubble('user', text, '⌨️ あなた · 送信中…', 'live');
   logEl.append(pending); scrollDown();
   const slow = setTimeout(() => { pending.querySelector('.meta').textContent = '⌨️ あなた · 応答待ち（Web 検索中の場合があります）…'; }, 4000);
-  try { await api('api/chat', { method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify({ message:text }) }); }
+  try {
+    const r = await api('api/chat', { method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify({ message:text, conversation_id:convId }) });
+    if (r.conversation_id && r.conversation_id !== convId) { convId = r.conversation_id; saveConvId(); }
+  }
   catch (err) { alert('送信に失敗しました: ' + err.message); }
-  finally { clearTimeout(slow); pending.remove(); btn.disabled = false; box.focus(); refreshHistory(true); }
+  finally { clearTimeout(slow); pending.remove(); btn.disabled = false; box.focus(); refreshHistory(true); refreshConversations(); refreshSkills(); }
 };
 
 // ---- voice chat (WebRTC; the backend relays SDP so no credential reaches the browser)
-let pc = null, dc = null, mic = null, liveEl = null;
+let pc = null, dc = null, mic = null, liveEl = null, voiceConv = null;
 const voiceBtn = $('#voiceBtn');
 function setVoiceState(text, on = false) {
   $('#voiceState').innerHTML = `<span class="dot${on ? ' on' : ''}"></span>`;
@@ -205,8 +383,9 @@ function setVoiceState(text, on = false) {
 }
 function saveTranscript(role, content) {
   content = (content || '').trim(); if (!content) return;
-  api('api/transcripts', { method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify({ role, content }) })
-    .then(() => refreshHistory()).catch(err => console.error(err));
+  const conversation_id = voiceConv; if (!conversation_id) return;
+  api('api/transcripts', { method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify({ role, content, conversation_id }) })
+    .then(() => { if (conversation_id === convId) refreshHistory(); refreshConversations(); }).catch(err => console.error(err));
 }
 function showLive(text) {
   if (!liveEl) { liveEl = bubble('assistant', '', '🎤 エージェント（話し中）', 'live'); logEl.append(liveEl); }
@@ -237,25 +416,48 @@ function onEvent(ev) {
 // The model asked for a tool (e.g. web_search): run it on the backend, return the result, ask it to continue.
 async function runToolCalls(calls) {
   for (const c of calls) {
-    let label = c.name;
-    try { label = JSON.parse(c.arguments || '{}').query || label; } catch {}
-    const note = bubble('assistant', `🔎 「${label}」を検索中…`, '🎤 エージェント', 'live');
+    let a = {};
+    try { a = JSON.parse(c.arguments || '{}'); } catch {}
+    const label = {
+      web_search: `🔎 「${a.query || ''}」を検索中…`,
+      load_skill: `📘 スキル「${a.name || ''}」を読み込み中…`,
+      read_skill_file: `📘 ${a.name || ''}/${a.path || ''} を読み込み中…`,
+      list_skills: '📘 スキル一覧を確認中…',
+      save_skill: '💾 スキルを保存中…',
+      write_skill_file: `💾 ${a.name || ''}/${a.path || ''} を保存中…`,
+    }[c.name] || `⚙ ${c.name} を実行中…`;
+    const note = bubble('assistant', label, '🎤 エージェント', 'live');
     logEl.append(note); scrollDown();
-    setVoiceState('検索中…', true);
+    setVoiceState(label.replace(/^\S+\s/, ''), true);
     let output;
     try { output = (await api('api/tools/call', { method:'POST', headers:{ 'Content-Type':'application/json' },
       body:JSON.stringify({ name:c.name, arguments:c.arguments || '{}' }) })).output; }
     catch (err) { output = 'ツール実行エラー: ' + err.message; }
     note.remove();
+    if (['save_skill', 'write_skill_file'].includes(c.name)) refreshSkills();
     if (!dc || dc.readyState !== 'open') return;
     dc.send(JSON.stringify({ type:'conversation.item.create', item:{ type:'function_call_output', call_id:c.call_id, output } }));
   }
   if (dc?.readyState === 'open') dc.send(JSON.stringify({ type:'response.create' }));
 }
 
+// Turn getUserMedia / connection errors into something the user can act on.
+function micErrorHelp(err) {
+  const site = location.host;
+  if (err.name === 'NotAllowedError' && /system/i.test(err.message))
+    return 'OS がマイクの使用をブロックしています。\nWindows: 設定 → プライバシーとセキュリティ → マイク で、マイクへのアクセスとデスクトップアプリ（ブラウザ）の許可をオンにしてください。\nmacOS: システム設定 → プライバシーとセキュリティ → マイク でブラウザを許可してください。';
+  if (err.name === 'NotAllowedError')
+    return `ブラウザがこのサイト（${site}）のマイクをブロックしています。\nアドレスバー左端のアイコン → 「マイク」を「許可」にして、ページを再読み込みしてください。`;
+  if (err.name === 'NotFoundError') return 'マイクが見つかりません。マイクが接続されているか確認してください。';
+  if (err.name === 'NotReadableError') return 'マイクを使用できません。ほかのアプリ（会議ツールなど）がマイクを使っていないか確認してください。';
+  return err.message;
+}
+
 async function startVoice() {
   voiceBtn.disabled = true; setVoiceState('マイクを準備中…');
   try {
+    if (!convId) { convId = (await api('api/conversations', { method:'POST' })).id; saveConvId(); refreshConversations(); }
+    voiceConv = convId;
     mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:true, noiseSuppression:true } });
     pc = new RTCPeerConnection();
     pc.ontrack = e => { $('#remote').srcObject = e.streams[0]; };
@@ -268,12 +470,12 @@ async function startVoice() {
     dc.onopen = () => setVoiceState('通話中：話しかけてください', true);
     await pc.setLocalDescription(await pc.createOffer());
     setVoiceState('接続中…');
-    const answer = await api('api/realtime/sdp', { method:'POST', headers:{ 'Content-Type':'application/sdp' }, body:pc.localDescription.sdp });
+    const answer = await api(`api/realtime/sdp?conversation_id=${encodeURIComponent(voiceConv)}`, { method:'POST', headers:{ 'Content-Type':'application/sdp' }, body:pc.localDescription.sdp });
     await pc.setRemoteDescription({ type:'answer', sdp:answer });
     voiceBtn.textContent = '⏹ 音声チャット終了'; voiceBtn.classList.add('danger');
   } catch (err) {
     stopVoice('開始できませんでした');
-    alert('音声チャットを開始できませんでした: ' + err.message);
+    alert('音声チャットを開始できませんでした。\n\n' + micErrorHelp(err));
   } finally { voiceBtn.disabled = false; }
 }
 
@@ -298,6 +500,7 @@ function download(url) {
   const a = document.createElement('a'); a.href = url; a.download = ''; document.body.append(a); a.click(); a.remove();
 }
 
+const expandedSkills = new Set(); // descriptions are collapsed by default
 async function refreshSkills() {
   const list = await api('api/skills');
   const ul = $('#skills'); ul.replaceChildren();
@@ -317,8 +520,13 @@ async function refreshSkills() {
     const title = document.createElement('strong'); title.textContent = s.name;
     const meta = document.createElement('span'); meta.className = 'hint';
     meta.textContent = `  ${s.file_count} ファイル · ${(s.size / 1024).toFixed(1)} KB`;
-    const desc = document.createElement('div'); desc.className = s.error ? 'err' : 'desc';
+    const desc = document.createElement('div');
+    desc.className = s.error ? 'err' : 'desc clamp' + (expandedSkills.has(s.name) ? ' open' : '');
     desc.textContent = s.error ? '⚠ ' + s.error : s.description;
+    if (!s.error) {
+      desc.title = 'クリックで全文を表示 / 折りたたみ';
+      desc.onclick = () => { desc.classList.toggle('open'); desc.classList.contains('open') ? expandedSkills.add(s.name) : expandedSkills.delete(s.name); };
+    }
     info.append(title, meta, desc);
     const actions = document.createElement('div'); actions.className = 'actions';
     const mk = (label, fn, cls = 'secondary') => { const b = document.createElement('button'); b.type = 'button'; b.className = cls; b.textContent = label; b.onclick = fn; actions.append(b); };
@@ -349,10 +557,11 @@ async function openEditor(name) {
       $('#skillEditorFiles').textContent = '';
     }
     editing = name || '';
-    $('#skillEditor').hidden = false; $('#skillContent').focus();
+    $('#skillDialog').showModal(); $('#skillContent').focus();
   } catch (e) { alert(e.message); }
 }
-function closeEditor() { editing = null; $('#skillEditor').hidden = true; }
+function closeEditor() { editing = null; if ($('#skillDialog').open) $('#skillDialog').close(); }
+$('#skillDialog').addEventListener('close', () => { editing = null; });
 
 $('#skillSaveBtn').onclick = async () => {
   const content = $('#skillContent').value;
@@ -365,6 +574,20 @@ $('#skillSaveBtn').onclick = async () => {
 $('#skillCancelBtn').onclick = closeEditor;
 $('#skillNewBtn').onclick = () => openEditor(null);
 $('#skillExportAllBtn').onclick = () => download('api/skills/export');
+$('#skillReloadBtn').onclick = async () => {
+  const btn = $('#skillReloadBtn');
+  btn.disabled = true; btn.textContent = '⟳ 読み込み中…';
+  try {
+    await refreshSkills();
+    btn.textContent = `✓ 更新しました ${new Date().toLocaleTimeString('ja-JP', { hour:'2-digit', minute:'2-digit', second:'2-digit' })}`;
+    if (pc) btn.title = '音声チャット中の変更は、次の音声チャット開始時に反映されます';
+  } catch (e) {
+    btn.textContent = '⟳ 再読み込み'; alert('再読み込みに失敗しました: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    setTimeout(() => { btn.textContent = '⟳ 再読み込み'; }, 3000);
+  }
+};
 $('#skillImportBtn').onclick = () => $('#skillFile').click();
 $('#skillFile').onchange = async e => {
   const overwrite = $('#skillOverwrite').checked, messages = [];
@@ -392,8 +615,12 @@ $('#job').onsubmit = async e => {
   refreshJobs();
 };
 
-refreshStatus(); refreshHistory(true); refreshJobs(); refreshSkills();
-setInterval(() => { if (!document.hidden) refreshHistory().catch(() => {}); }, 15000);
+refreshStatus(); refreshConversations().then(() => refreshHistory(true)); refreshJobs(); refreshSkills();
+// On wide screens the left pane has room, so show skills and jobs expanded.
+if (matchMedia('(min-width: 900px)').matches) { $('#chatsCard').open = true; $('#skillsCard').open = true; $('#jobsCard').open = true; }
+setInterval(() => { if (!document.hidden) { refreshHistory().catch(() => {}); refreshConversations().catch(() => {}); } }, 15000);
+// The Markdown libraries load with defer; re-render once they are ready.
+window.addEventListener('load', () => { lastHistory = ''; refreshHistory(true).catch(() => {}); });
 </script>
 </body>
 </html>

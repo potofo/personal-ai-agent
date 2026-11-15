@@ -21,7 +21,7 @@ tags: [ai, agent, docker, azure-openai]
 
 作成後、ワークスペースの **Personal AI Agent** アプリを開きます。音声チャットではブラウザのマイク許可が必要です。
 
-アプリの「スキル」セクションで、Agent Skills（SKILL.md を含むフォルダの .zip / .skill）のインポート、エクスポート、有効化/無効化、編集ができます。スキルはワークスペースのボリュームに保存されます。
+アプリの「スキル」セクションで、Agent Skills（SKILL.md を含むフォルダの .zip / .skill）のインポート、エクスポート、有効化/無効化、編集ができます。スキルはワークスペースのボリュームに保存されます。初回起動時に Anthropic の skill-creator（Apache-2.0）が既定スキルとして入ります。
 
 ## 管理者向け
 

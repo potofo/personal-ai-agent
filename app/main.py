@@ -40,6 +40,7 @@ DB = os.path.join(DATA, 'agent.db')
 TZ = os.getenv('APP_TIMEZONE', 'Asia/Tokyo')
 STATIC = Path(__file__).parent / 'static'
 skills = SkillStore(Path(DATA) / 'skills')
+DEFAULT_SKILLS = Path(__file__).parent / 'default_skills'
 CONTEXT_MESSAGES = int(os.getenv('CONTEXT_MESSAGES', '20'))
 BASE_INSTRUCTIONS = os.getenv('AGENT_INSTRUCTIONS') or (
     'あなたはユーザー専属の日本語パーソナルアシスタントです。簡潔で親切に答えてください。'
@@ -89,43 +90,90 @@ def azure_error(r: httpx.Response) -> AzureError:
 
 # ---------------------------------------------------------------- storage
 
+JOBS_CONVERSATION = 'jobs'  # scheduled job results go to their own conversation
+
+
+def now_iso() -> str:
+    return datetime.now(ZoneInfo(TZ)).isoformat(timespec='seconds')
+
+
 def db() -> sqlite3.Connection:
     c = sqlite3.connect(DB, timeout=10)
     c.execute('PRAGMA journal_mode=WAL')
     c.execute('CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, role TEXT, content TEXT, created TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, hour INTEGER, minute INTEGER, prompt TEXT)')
-    if 'channel' not in [r[1] for r in c.execute('PRAGMA table_info(messages)')]:
+    c.execute('CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, title TEXT NOT NULL, '
+              "kind TEXT NOT NULL DEFAULT 'chat', created TEXT NOT NULL, updated TEXT NOT NULL)")
+    cols = [r[1] for r in c.execute('PRAGMA table_info(messages)')]
+    if 'channel' not in cols:
         c.execute("ALTER TABLE messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'text'")
+    if 'conversation_id' not in cols:
+        c.execute('ALTER TABLE messages ADD COLUMN conversation_id TEXT')
+        c.execute('CREATE INDEX IF NOT EXISTS messages_conversation ON messages(conversation_id, id)')
+    # Messages from before conversations existed become one conversation ("これまでの会話").
+    if c.execute('SELECT 1 FROM messages WHERE conversation_id IS NULL LIMIT 1').fetchone():
+        first, last = c.execute('SELECT MIN(created), MAX(created) FROM messages WHERE conversation_id IS NULL').fetchone()
+        legacy = str(uuid.uuid4())
+        c.execute('INSERT INTO conversations VALUES(?,?,?,?,?)', (legacy, 'これまでの会話', 'chat', first or now_iso(), last or now_iso()))
+        c.execute('UPDATE messages SET conversation_id=? WHERE conversation_id IS NULL', (legacy,))
+    c.commit()
     return c
 
 
-def record(role: str, content: str, channel: str = 'text') -> None:
+def create_conversation(title: str = '新しいチャット', kind: str = 'chat', conv_id: str | None = None) -> str:
+    conv_id = conv_id or str(uuid.uuid4())
     with closing(db()) as c, c:
-        c.execute('INSERT INTO messages(role,content,created,channel) VALUES(?,?,?,?)',
-                  (role, content, datetime.now(ZoneInfo(TZ)).isoformat(timespec='seconds'), channel))
+        c.execute('INSERT OR IGNORE INTO conversations VALUES(?,?,?,?,?)', (conv_id, title, kind, now_iso(), now_iso()))
+    return conv_id
 
 
-def recent_messages(limit: int) -> list[dict]:
+def conversation_exists(conv_id: str) -> bool:
     with closing(db()) as c:
-        rows = c.execute('SELECT role,content,created,channel FROM messages ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
+        return c.execute('SELECT 1 FROM conversations WHERE id=?', (conv_id,)).fetchone() is not None
+
+
+def record(role: str, content: str, channel: str, conv_id: str) -> None:
+    with closing(db()) as c, c:
+        ts = now_iso()
+        c.execute('INSERT INTO messages(role,content,created,channel,conversation_id) VALUES(?,?,?,?,?)',
+                  (role, content, ts, channel, conv_id))
+        c.execute('UPDATE conversations SET updated=? WHERE id=?', (ts, conv_id))
+        if role == 'user':  # name a new chat after its first message
+            title = ' '.join(content.split())[:40]
+            c.execute("UPDATE conversations SET title=? WHERE id=? AND title='新しいチャット'", (title, conv_id))
+
+
+def recent_messages(conv_id: str, limit: int) -> list[dict]:
+    with closing(db()) as c:
+        rows = c.execute('SELECT role,content,created,channel FROM messages WHERE conversation_id=? '
+                         'ORDER BY id DESC LIMIT ?', (conv_id, limit)).fetchall()
     return [{'role': r, 'content': t, 'created': d, 'channel': ch} for r, t, d, ch in reversed(rows)]
 
 
-def instructions() -> str:
-    """Base instructions plus recent shared history, so text and voice share one memory."""
+def instructions(conv_id: str | None, channel: str = 'text') -> str:
+    """Base instructions plus this conversation's recent history (shared by its text and voice turns)."""
     now = datetime.now(ZoneInfo(TZ)).strftime('%Y-%m-%d %H:%M')
     lines = [BASE_INSTRUCTIONS, f'現在日時: {now}（{TZ}）']
+    if channel == 'voice':
+        lines.append('いまは音声で会話しています。Markdown の記号やコード、URL は読み上げず、自然な話し言葉で答えてください。'
+                     '図やインフォグラフィックを求められたら、要点を口頭で伝え、テキストチャットで頼めば図を表示できると案内してください。')
+    else:
+        lines.append('回答は Markdown（見出し、箇条書き、表、太字、絵文字）で読みやすく書いてかまいません。'
+                     'インフォグラフィック、図解、チャート、ダッシュボード風のまとめなど視覚的な表示を求められたら、短い説明に続けて '
+                     '```html のコードブロックを 1 つ出力してください。画面がそれを図として描画します。'
+                     'HTML は自己完結させ、インラインの CSS と SVG だけを使います（<script>、外部の画像・フォント・CSS の読み込みは禁止）。'
+                     '幅は 100%（最大 760px 程度）で、スマートフォンでも崩れないようにし、天気などはアイコンを SVG か絵文字で描いてください。')
     if settings()['search_deployment']:
         lines.append('ニュース、株価、天気、最近の出来事、自信のない事実など、最新または正確な情報が必要な質問には、'
                      '推測で答えずに web_search ツールで調べてから、出典（サイト名）を添えて答えてください。'
                      '音声で話しているときは、検索の前に「調べますね」と短く伝えてください。')
     if skill_text := skills.instructions():
         lines.append(skill_text)
-    history = recent_messages(CONTEXT_MESSAGES)
+    history = recent_messages(conv_id, CONTEXT_MESSAGES) if conv_id else []
     if history:
         names = {'user': 'ユーザー', 'assistant': 'アシスタント', 'job': '定期ジョブ結果'}
-        lines.append('以下はこれまでの会話（テキスト・音声・定期ジョブ）の直近の記録です。文脈として参照してください。')
-        lines += [f"[{names.get(m['role'], m['role'])}] {m['content'][:1000]}" for m in history]
+        lines.append('以下はこのチャットのこれまでの記録（テキスト・音声）です。文脈として参照してください。')
+        lines += [f"[{names.get(m['role'], m['role'])}] {m['content'][:1500]}" for m in history]
     return '\n'.join(lines)
 
 
@@ -183,8 +231,8 @@ async def run_tool(name: str, arguments: str) -> str:
                 return 'エラー: query が空です'
             log.info('web_search: %s', query)
             return await web_search(query)
-        if name in ('load_skill', 'read_skill_file'):
-            log.info('%s: %s', name, args)
+        if name in ('load_skill', 'read_skill_file', 'list_skills', 'save_skill', 'write_skill_file'):
+            log.info('%s: %s', name, {k: (v[:80] + '…' if isinstance(v, str) and len(v) > 80 else v) for k, v in args.items()})
             return skills.run_tool(name, args)
         return f'エラー: 不明なツール {name}'
     except (AzureError, SkillError, ValueError) as e:
@@ -270,7 +318,7 @@ def voice_session(s: dict, instr: str) -> dict:
     return session
 
 
-async def webrtc_answer(offer_sdp: str) -> str:
+async def webrtc_answer(offer_sdp: str, conv_id: str) -> str:
     """Mint a short-lived client secret with the user's key, then exchange SDP with Azure."""
     s = require_settings()
     calls_url = os.getenv('AZURE_OPENAI_REALTIME_WEBRTC_URL') or f"{s['endpoint']}/openai/v1/realtime/calls?webrtc_filter=on"
@@ -278,7 +326,7 @@ async def webrtc_answer(offer_sdp: str) -> str:
         async with httpx.AsyncClient(timeout=30) as http:
             r = await http.post(f"{s['endpoint']}/openai/v1/realtime/client_secrets",
                                 headers={'api-key': s['api_key']},
-                                json={'session': voice_session(s, instructions())})
+                                json={'session': voice_session(s, instructions(conv_id, 'voice'))})
             if r.status_code >= 400:
                 raise azure_error(r)
             body = r.json()
@@ -298,11 +346,12 @@ async def webrtc_answer(offer_sdp: str) -> str:
 
 def run_job(job_id: str, prompt: str) -> None:
     try:
-        answer = asyncio.run(realtime_text(prompt, instructions()))
+        answer = asyncio.run(realtime_text(prompt, instructions(None)))
     except Exception as e:  # noqa: BLE001 - record any failure in history
         log.exception('job %s failed', job_id)
         answer = f'ジョブ実行失敗: {e}'
-    record('job', f'{prompt}\n→ {answer}', 'job')
+    create_conversation('⏰ 定期ジョブの結果', 'jobs', JOBS_CONVERSATION)
+    record('job', f'{prompt}\n→ {answer}', 'job', JOBS_CONVERSATION)
 
 
 def register(job_id: str, hour: int, minute: int, prompt: str) -> None:
@@ -314,6 +363,11 @@ def register(job_id: str, hour: int, minute: int, prompt: str) -> None:
 async def lifespan(_app):
     with closing(db()) as c:
         rows = c.execute('SELECT id,hour,minute,prompt FROM jobs').fetchall()
+    try:
+        if added := skills.seed_defaults(DEFAULT_SKILLS):
+            log.info('seeded default skills: %s', ', '.join(added))
+    except (OSError, SkillError) as e:  # never block startup on this
+        log.warning('could not seed default skills: %s', e)
     scheduler.start()
     for row in rows:
         register(*row)
@@ -328,11 +382,17 @@ app = FastAPI(lifespan=lifespan, title='Personal AI Agent')
 
 class Chat(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
+    conversation_id: str | None = Field(default=None, max_length=64)
 
 
 class Transcript(BaseModel):
     role: Literal['user', 'assistant']
     content: str = Field(min_length=1, max_length=8000)
+    conversation_id: str = Field(min_length=1, max_length=64)
+
+
+class ConversationTitle(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
 
 
 class ToolCall(BaseModel):
@@ -367,25 +427,64 @@ def status():
             'web_search': s['search_deployment'] or None}
 
 
+def require_conversation(conv_id: str) -> str:
+    if not conversation_exists(conv_id):
+        raise HTTPException(404, 'チャットが見つかりません（削除された可能性があります）')
+    return conv_id
+
+
 @app.post('/api/chat')
 async def chat(req: Chat):
-    instr = instructions()  # history before this turn
-    record('user', req.message)
+    """Without conversation_id a new chat is created; the response says which one was used."""
+    conv_id = require_conversation(req.conversation_id) if req.conversation_id else create_conversation()
+    instr = instructions(conv_id)  # history before this turn
+    record('user', req.message, 'text', conv_id)
     try:
         answer = await realtime_text(req.message, instr)
     except AzureError as e:
         raise HTTPException(503, str(e)) from e
-    record('assistant', answer)
-    return {'answer': answer}
+    record('assistant', answer, 'text', conv_id)
+    return {'answer': answer, 'conversation_id': conv_id}
+
+
+@app.get('/api/conversations')
+def list_conversations():
+    with closing(db()) as c:
+        rows = c.execute('SELECT c.id, c.title, c.kind, c.created, c.updated, COUNT(m.id) FROM conversations c '
+                         'LEFT JOIN messages m ON m.conversation_id = c.id GROUP BY c.id ORDER BY c.updated DESC').fetchall()
+    return [{'id': i, 'title': t, 'kind': k, 'created': cr, 'updated': u, 'message_count': n} for i, t, k, cr, u, n in rows]
+
+
+@app.post('/api/conversations')
+def new_conversation():
+    return {'id': create_conversation()}
+
+
+@app.patch('/api/conversations/{conv_id}')
+def rename_conversation(conv_id: str, req: ConversationTitle):
+    require_conversation(conv_id)
+    with closing(db()) as c, c:
+        c.execute('UPDATE conversations SET title=? WHERE id=?', (req.title.strip(), conv_id))
+    return {'id': conv_id, 'title': req.title.strip()}
+
+
+@app.delete('/api/conversations/{conv_id}')
+def delete_conversation(conv_id: str):
+    require_conversation(conv_id)
+    with closing(db()) as c, c:
+        c.execute('DELETE FROM messages WHERE conversation_id=?', (conv_id,))
+        c.execute('DELETE FROM conversations WHERE id=?', (conv_id,))
+    return {'deleted': True}
 
 
 @app.post('/api/realtime/sdp')
-async def realtime_sdp(request: Request):
+async def realtime_sdp(request: Request, conversation_id: str):
+    require_conversation(conversation_id)
     offer = (await request.body()).decode(errors='replace')
     if not offer.startswith('v=0') or len(offer) > 100_000:
         raise HTTPException(400, 'SDP offer が不正です')
     try:
-        return Response(await webrtc_answer(offer), media_type='application/sdp')
+        return Response(await webrtc_answer(offer, conversation_id), media_type='application/sdp')
     except AzureError as e:
         raise HTTPException(503, str(e)) from e
 
@@ -398,13 +497,13 @@ async def tools_call(req: ToolCall):
 
 @app.post('/api/transcripts')
 def add_transcript(req: Transcript):
-    record(req.role, req.content, 'voice')
+    record(req.role, req.content, 'voice', require_conversation(req.conversation_id))
     return {'ok': True}
 
 
 @app.get('/api/history')
-def history():
-    return recent_messages(100)
+def history(conversation_id: str):
+    return recent_messages(require_conversation(conversation_id), 200)
 
 
 @app.post('/api/jobs')

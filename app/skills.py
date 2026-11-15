@@ -27,6 +27,7 @@ MAX_FILES = 300
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_TOTAL_BYTES = 50 * 1024 * 1024
 MAX_READ_CHARS = 40_000  # what a tool call returns to the model
+MAX_WRITE_BYTES = 200 * 1024  # a file the model writes with write_skill_file
 IGNORED_PARTS = {'__MACOSX', '.git', '__pycache__', '.DS_Store'}
 
 SKILL_TEMPLATE = """---
@@ -99,17 +100,43 @@ class SkillStore:
 
     # ------------------------------------------------------------ state
 
-    def _disabled(self) -> set[str]:
+    def _state(self) -> dict:
         try:
-            return set(json.loads(self.state_file.read_text()).get('disabled', []))
+            state = json.loads(self.state_file.read_text())
+            return state if isinstance(state, dict) else {}
         except (OSError, ValueError):
-            return set()
+            return {}
+
+    def _update_state(self, key: str, values: set[str]) -> None:
+        state = self._state()
+        state[key] = sorted(values)
+        self.state_file.write_text(json.dumps(state, ensure_ascii=False))
+
+    def _disabled(self) -> set[str]:
+        return set(self._state().get('disabled', []))
 
     def set_enabled(self, name: str, enabled: bool) -> None:
         self._dir(name)
         disabled = self._disabled()
         (disabled.discard if enabled else disabled.add)(name)
-        self.state_file.write_text(json.dumps({'disabled': sorted(disabled)}))
+        self._update_state('disabled', disabled)
+
+    def seed_defaults(self, source: Path) -> list[str]:
+        """Copy bundled default skills in once. A skill seeded before is never re-added,
+        so a user who deleted, disabled or edited it keeps that choice."""
+        seeded, added = set(self._state().get('seeded', [])), []
+        if not source.is_dir():
+            return added
+        for src in sorted(p for p in source.iterdir() if (p / 'SKILL.md').is_file()):
+            name = parse_skill_md((src / 'SKILL.md').read_text(encoding='utf-8'))[0]['name']
+            if name in seeded:
+                continue
+            if not (self.root / name).exists():  # never overwrite a user's skill of the same name
+                shutil.copytree(src, self.root / name, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+                added.append(name)
+            seeded.add(name)
+        self._update_state('seeded', seeded)
+        return added
 
     # ------------------------------------------------------------ read
 
@@ -172,8 +199,7 @@ class SkillStore:
 
     def delete(self, name: str) -> None:
         shutil.rmtree(self._dir(name))
-        disabled = self._disabled() - {name}
-        self.state_file.write_text(json.dumps({'disabled': sorted(disabled)}))
+        self._update_state('disabled', self._disabled() - {name})
 
     # ------------------------------------------------------------ import / export
 
@@ -244,40 +270,99 @@ class SkillStore:
                     zf.write(d / f['path'], f'{name}/{f["path"]}')
         return buf.getvalue()
 
+    def write_file(self, name: str, path: str, content: str) -> str:
+        """Write a bundled text file (e.g. references/guide.md) into an existing skill."""
+        d = self._dir(name)
+        rel = _safe_rel(path)
+        if rel is None or not rel.parts or rel.as_posix() == 'SKILL.md':
+            raise SkillError('このパスには書き込めません（SKILL.md は save_skill で保存します）')
+        if len(content.encode('utf-8')) > MAX_WRITE_BYTES:
+            raise SkillError(f'ファイルが大きすぎます（上限 {MAX_WRITE_BYTES // 1024}KB）')
+        target = d / rel
+        if not target.resolve().is_relative_to(d.resolve()):
+            raise SkillError(f'不正なパスです: {path}')
+        if not target.exists() and len(self.files(name)) >= MAX_FILES:
+            raise SkillError('ファイル数が上限に達しています')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding='utf-8')
+        return rel.as_posix()
+
     # ------------------------------------------------------------ model integration
 
     def instructions(self) -> str:
+        creator = any(sk['name'] == 'skill-creator' for sk in self.enabled())
+        lines = ['スキル（Agent Skills）の作成・修正を頼まれたら、'
+                 + ('まず load_skill で skill-creator を読み、その進め方（意図の確認、description の書き方、段階的な読み込み、'
+                    '参照ファイルの分け方）に従ってください。ただしこの環境では、スクリプトの実行、サブエージェント、評価ループ、'
+                    'ファイルやディレクトリの直接操作、.skill へのパッケージ化はできません。それらの手順は省き、'
+                    if creator else '')
+                 + 'SKILL.md（1 行目「---」、name は英小文字・数字・ハイフン、description は何をするか・どんなときに使うか、「---」、'
+                 '続けて Markdown の手順）は save_skill で、長い参照資料は write_skill_file で references/ などに保存してください。'
+                 '保存が成功するまで「作成した」「完成した」と言ってはいけません。'
+                 '既存のスキルを直すときは、先に load_skill で現在の内容を読み、上書きしてよいかユーザーに確認してから保存します。'
+                 'スキルの削除はできないので、画面の「スキル」から削除するよう案内してください。'
+                 'ユーザーへの返答では、ツール名（load_skill など）や内部の手順には触れず、自然な言葉で話してください。']
         skills = self.enabled()
-        if not skills:
-            return ''
-        lines = ['利用可能なスキル（Agent Skills）があります。ユーザーの依頼がスキルの説明に当てはまる場合は、'
-                 '回答の前に load_skill でそのスキルの手順を読み込み、それに従ってください。'
-                 'スキル内の参照ファイルが必要なら read_skill_file で読みます。スクリプトは実行できません。']
-        lines += [f"- {s['name']}: {' '.join(s['description'].split())}" for s in skills]
+        if skills:
+            lines.append('利用可能なスキルがあります。ユーザーの依頼がスキルの説明に当てはまる場合は、'
+                         '回答の前に load_skill でそのスキルの手順を読み込み、それに従ってください。'
+                         'スキル内の参照ファイルが必要なら read_skill_file で読みます。スクリプトは実行できません。')
+            lines += [f"- {s['name']}: {' '.join(s['description'].split())}" for s in skills]
         return '\n'.join(lines)
 
     def tool_defs(self) -> list[dict]:
-        if not self.enabled():
-            return []
+        name_prop = {'name': {'type': 'string', 'description': 'スキル名'}}
         return [
             {'type': 'function', 'name': 'load_skill',
-             'description': 'スキルの手順書（SKILL.md）と同梱ファイルの一覧を読み込む。依頼がスキルの説明に当てはまるときに最初に使う。',
-             'parameters': {'type': 'object', 'properties': {'name': {'type': 'string', 'description': 'スキル名'}},
-                            'required': ['name']}},
+             'description': 'スキルの手順書（SKILL.md）と同梱ファイルの一覧を読み込む。依頼がスキルの説明に当てはまるとき、'
+                            'または既存スキルを修正する前に使う。',
+             'parameters': {'type': 'object', 'properties': name_prop, 'required': ['name']}},
             {'type': 'function', 'name': 'read_skill_file',
              'description': 'スキルに同梱されたファイル（references/ など）を読む。',
-             'parameters': {'type': 'object', 'properties': {
-                 'name': {'type': 'string', 'description': 'スキル名'},
+             'parameters': {'type': 'object', 'properties': name_prop | {
                  'path': {'type': 'string', 'description': 'スキルフォルダからの相対パス（例: references/guide.md）'}},
                  'required': ['name', 'path']}},
+            {'type': 'function', 'name': 'list_skills',
+             'description': '保存されているすべてのスキル（無効なものを含む）の名前・説明・有効状態を一覧する。',
+             'parameters': {'type': 'object', 'properties': {}}},
+            {'type': 'function', 'name': 'save_skill',
+             'description': 'スキルを新規作成または更新する。content には YAML フロントマター（name, description）付きの SKILL.md 全文を渡す。',
+             'parameters': {'type': 'object', 'properties': {
+                 'content': {'type': 'string', 'description': 'SKILL.md の全文（先頭は ---）'}}, 'required': ['content']}},
+            {'type': 'function', 'name': 'write_skill_file',
+             'description': '既存スキルに参照ファイル（references/ や assets/ のテキスト）を書き込む。SKILL.md には使わない。',
+             'parameters': {'type': 'object', 'properties': name_prop | {
+                 'path': {'type': 'string', 'description': '相対パス（例: references/format.md）'},
+                 'content': {'type': 'string', 'description': 'ファイルの内容（テキスト）'}},
+                 'required': ['name', 'path', 'content']}},
         ]
 
     def run_tool(self, tool: str, args: dict) -> str:
-        name = str(args.get('name', '')).strip()
-        if name not in {s['name'] for s in self.enabled()}:
-            raise SkillError(f'有効なスキル「{name}」はありません')
+        if tool == 'list_skills':
+            items = self.all()
+            if not items:
+                return 'スキルはまだありません。'
+            return '\n'.join(f"- {s['name']}（{'有効' if s['enabled'] else '無効'}）: {s['error'] or s['description']}"
+                             for s in items)
+        if tool == 'save_skill':
+            content = str(args.get('content', ''))
+            if len(content) > 200_000:
+                raise SkillError('SKILL.md が大きすぎます')
+            name = parse_skill_md(content)[0]['name']
+            existed = (self.root / name / 'SKILL.md').is_file()
+            self.save(content)
+            return (f'スキル「{name}」を{"更新" if existed else "新規作成"}して保存しました。'
+                    f'{"" if name not in self._disabled() else "（このスキルは現在無効です）"}'
+                    '画面の「スキル」で確認・編集・エクスポートできます。')
+        name = check_name(str(args.get('name', '')).strip())
+        if tool == 'write_skill_file':
+            path = self.write_file(name, str(args.get('path', '')), str(args.get('content', '')))
+            return f'スキル「{name}」に {path} を保存しました。'
+        note = '（注意: このスキルは無効です。編集目的でのみ参照してください）\n' if name in self._disabled() else ''
         if tool == 'load_skill':
             files = [f['path'] for f in self.files(name) if f['path'] != 'SKILL.md']
             body = self.read_file(name, 'SKILL.md')
-            return body + ('\n\n同梱ファイル:\n' + '\n'.join(f'- {p}' for p in files) if files else '')
-        return self.read_file(name, str(args.get('path', '')))
+            return note + body + ('\n\n同梱ファイル:\n' + '\n'.join(f'- {p}' for p in files) if files else '')
+        if tool == 'read_skill_file':
+            return note + self.read_file(name, str(args.get('path', '')))
+        raise SkillError(f'不明なツール {tool}')
